@@ -358,6 +358,7 @@ open class Session: ObservableObject {
     
     private func teardown() {
         // Finish AsyncStream
+        /*
         streamContinuation?.finish()
         streamContinuation = nil
 
@@ -370,5 +371,6 @@ open class Session: ObservableObject {
         agent = Agent()
         messagesDict.removeAll()
         error = nil
+         */
     }
 }
