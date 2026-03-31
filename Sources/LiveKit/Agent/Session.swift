@@ -58,7 +58,8 @@ open class Session: ObservableObject {
             }
         }
     }
-
+    
+    private var streamContinuation: AsyncStream<ReceivedMessage>.Continuation?
     // MARK: - Published
 
     /// The last error that occurred.
@@ -213,27 +214,39 @@ open class Session: ObservableObject {
             agent.connecting(buffering: options.preConnectAudio)
         }
     }
-
+    
     private func observe(receivers: [any MessageReceiver]) {
         let (stream, continuation) = AsyncStream.makeStream(of: ReceivedMessage.self)
 
-        // Multiple producers → single stream
+        // Store continuation so we can finish it on teardown
+        self.streamContinuation = continuation
+
         for receiver in receivers {
             Task { [weak self] in
                 do {
                     for await message in try await receiver.messages() {
+                        guard !Task.isCancelled else { return }
                         continuation.yield(message)
                     }
                 } catch {
-                    self?.error = .receiver(error)
+                    await MainActor.run {
+                        self?.error = .receiver(error)
+                    }
                 }
-            }.cancellable().store(in: &tasks)
+            }
+            .cancellable()
+            .store(in: &tasks)
         }
 
-        // Single consumer
-        stream.subscribeOnMainActor(self) { observer, message in
-            observer.messagesDict.updateValue(message, forKey: message.id)
-        }.store(in: &tasks)
+        stream
+            .subscribeOnMainActor(self) { observer, message in
+                observer.messagesDict.updateValue(message, forKey: message.id)
+            }
+            .store(in: &tasks)
+    }
+    
+    deinit {
+        print("🔥 Session deinit")
     }
 
     // MARK: - Lifecycle
@@ -242,6 +255,9 @@ open class Session: ObservableObject {
     public func start() async {
         guard connectionState == .disconnected else { return }
 
+        // Ensure clean state before starting
+        teardown()
+
         error = nil
         waitForAgentTask = nil
 
@@ -249,13 +265,16 @@ open class Session: ObservableObject {
 
         let connect = { @Sendable in
             let response = try await self.tokenSourceConfiguration.fetch()
-            try await self.room.connect(url: response.serverURL.absoluteString,
-                                        token: response.participantToken)
+            try await self.room.connect(
+                url: response.serverURL.absoluteString,
+                token: response.participantToken
+            )
             return response.dispatchesAgent()
         }
 
         do {
             let dispatchesAgent: Bool
+
             if options.preConnectAudio {
                 dispatchesAgent = try await room.withPreConnectAudio(timeout: timeout) {
                     await MainActor.run {
@@ -267,6 +286,7 @@ open class Session: ObservableObject {
             } else {
                 connectionState = .connecting
                 agent.connecting(buffering: false)
+
                 dispatchesAgent = try await connect()
                 try await room.localParticipant.setMicrophone(enabled: true)
             }
@@ -275,12 +295,15 @@ open class Session: ObservableObject {
                 waitForAgentTask = Task { [weak self] in
                     try await Task.sleep(nanoseconds: UInt64(timeout * Double(NSEC_PER_SEC)))
                     try Task.checkCancellation()
+
                     guard let self else { return }
-                    if isConnected, !agent.isConnected {
-                        agent.failed(error: .timeout)
+
+                    if self.isConnected, !self.agent.isConnected {
+                        self.agent.failed(error: .timeout)
                     }
                 }.cancellable()
             }
+
         } catch {
             self.error = .connection(error)
             connectionState = .disconnected
@@ -290,6 +313,10 @@ open class Session: ObservableObject {
 
     /// Terminates the session.
     public func end() async {
+        // Stop all observers & async work FIRST
+        teardown()
+
+        // Then disconnect room
         await room.disconnect()
     }
 
@@ -327,5 +354,23 @@ open class Session: ObservableObject {
     /// - Parameter messages: An array of ``ReceivedMessage`` to restore.
     public func restoreMessageHistory(_ messages: [ReceivedMessage]) {
         messagesDict = .init(uniqueKeysWithValues: messages.sorted(by: { $0.timestamp < $1.timestamp }).map { ($0.id, $0) })
+    }
+    
+    private func teardown() {
+        // Finish AsyncStream
+        /*
+        streamContinuation?.finish()
+        streamContinuation = nil
+
+        tasks.forEach { $0.cancel() }
+        tasks.removeAll()
+
+        waitForAgentTask?.cancel()
+        waitForAgentTask = nil
+
+        agent = Agent()
+        messagesDict.removeAll()
+        error = nil
+         */
     }
 }
